@@ -1586,9 +1586,11 @@ class PsiphonNetwork(psi_ops_cms.PersistentObject):
         # NOTE: This will also call save() only if a host has been removed and
         # __deploy_stats_config_required is set. If hosts have only been disabled, a save()
         # might not occur.
-        self.deploy()
+        # NEW: caller is responsible for deploy(), to reduce the number of save()'s when
+        # this is called in a loop.
+        #self.deploy()
 
-        if number_removed == 0 and number_disabled > 0:
+        if number_removed > 0 or number_disabled > 0:
             self.save()
 
         return number_removed, number_disabled
@@ -2060,10 +2062,17 @@ class PsiphonNetwork(psi_ops_cms.PersistentObject):
             ssh.exec_command('tar czvf /root/etc.tar.gz /etc/*')
             ssh.get_file('/root/etc.tar.gz', './Migration/' + host.ip_address + '-etc.tar.gz')
         elif action == 'restore':
-            ssh = psi_ssh.SSH(
-                    host.ip_address, host.ssh_port,
-                    host.ssh_username, host.ssh_password,
-                    self.__linode_account.tcs_base_host_public_key)
+            if host.provider == 'digitalocean':
+                ssh = psi_ssh.SSH(
+                        host.ip_address, host.ssh_port,
+                        host.ssh_username, None, None,
+                        self.__digitalocean_account.base_rsa_private_key)
+                ssh.exec_command('echo "root:%s" | chpasswd' % (host.ssh_password))
+            elif host.provider == 'linode':
+                ssh = psi_ssh.SSH(
+                        host.ip_address, host.ssh_port,
+                        host.ssh_username, host.ssh_password,
+                        self.__linode_account.tcs_base_host_public_key)
             import shlex
             subprocess.Popen(shlex.split('mkdir ./Migration/' + host.ip_address))
             subprocess.Popen(shlex.split('tar xzvf ./Migration/' + host.ip_address + '-etc.tar.gz -C ./Migration/' + host.ip_address))
@@ -2076,6 +2085,9 @@ class PsiphonNetwork(psi_ops_cms.PersistentObject):
                     remote_fliepath = os.path.join(remote_path, filename)
                     # put file
                     ssh.put_file(local_path, remote_fliepath)
+            ssh.exec_command('sed -i -e "/^PasswordAuthentication no/s/^.*$/PasswordAuthentication yes/" /etc/ssh/sshd_config')
+            ssh.exec_command('sed -i -e "/PasswordAuthentication yes/s/^#//" /etc/ssh/sshd_config')
+            ssh.exec_command('service ssh restart')
         else:
             print('Action is not supported, please use "backup" or "restore"')
             return
@@ -2098,6 +2110,13 @@ class PsiphonNetwork(psi_ops_cms.PersistentObject):
         server.web_server_private_key = '-----BEGIN RSA PRIVATE KEY-----\n' + server.web_server_private_key + '\n-----END RSA PRIVATE KEY-----\n'
         server.TCS_ssh_private_key = self.run_command_on_host(host, 'cat /etc/ssh/ssh_host_rsa_key.psiphon_ssh_%s' % (host.ip_address))
 
+        if host.is_TCS == True:
+            migrated_from = 'TCS Docker'
+        else:
+            migrated_from = 'Legacy'
+
+        server.log('Migrated' + ' from ' + migrated_from + ' to TCS ' + TCS_type)
+        
         host.is_TCS = True
         host.TCS_type = TCS_type
 
@@ -4014,11 +4033,11 @@ def prune_all_propagation_channels():
     psinet.show_status()
     try:
         propagation_channels = psinet._PsiphonNetwork__propagation_channels.values()
-        random.shuffle(propagation_channels)
-        for propagation_channel in propagation_channels[0:10]:
+        for propagation_channel in propagation_channels:
             number_removed, number_disabled = psinet.prune_propagation_channel_servers(propagation_channel.name)
             sys.stderr.write('Pruned %d servers from %s\n' % (number_removed, propagation_channel.name))
             sys.stderr.write('Disabled %d servers from %s\n' % (number_disabled, propagation_channel.name))
+        psinet.deploy()
     finally:
         psinet.show_status()
         psinet.release()
